@@ -1,0 +1,206 @@
+module iic_controller(
+	input sys_clk, //50MHz
+	input reset, //reset
+	input en, //enable
+	input read_write_flag, //indicating read from or write to slave
+	output byte_ack, //active high when a byte transfer accomplished
+	inout [7:0] data_inout,
+	output sclk, // 0.625MHz
+	inout sdata
+    );
+//registers
+reg sclk_reg = 0, sclk2_reg = 0, sclk4_reg = 0;
+reg en_delay = 0, en_rising = 0;
+reg byte_ack_reg = 0;
+reg sdata_reg = 0;
+reg proceed_initiate = 0;
+reg [7:0] cnt1_sys_clk = 0, cnt2_sys_clk = 0, cnt3_sys_clk =0;
+reg [3:0] cnt_bit = 0;
+reg [3:0] state = 0;
+reg [7:0] datain_reg = 0, dataout_reg = 0;
+reg sdata_in_out_flag = 0; //sdata 	"input: 1'b1" 	"output: 1'b0"
+reg state_delay = 0;
+//state parameters
+parameter idle = 0,
+			 write = 1,
+			 read = 2;
+
+//sclk_reg 		sclk2_reg 		sclk4_reg
+always @(posedge sys_clk) begin
+	if(reset==1'b1) begin
+		cnt1_sys_clk <= 0;
+		cnt2_sys_clk <= 0;
+		cnt3_sys_clk <= 0; end
+	else if(reset==1'b0) begin
+		cnt1_sys_clk <= (cnt1_sys_clk==39)? 0 : cnt1_sys_clk + 1'b1;
+		sclk_reg <= (cnt1_sys_clk==39)? !sclk_reg : sclk_reg; //sclk_reg 0.625MHz
+		cnt2_sys_clk <= (cnt2_sys_clk==19)? 0 : cnt2_sys_clk + 1'b1;
+		sclk2_reg <= (cnt2_sys_clk==19)? !sclk2_reg : sclk2_reg; //sclk2_reg 1.25MHz
+		cnt3_sys_clk <= (cnt3_sys_clk==9)? 0 : cnt3_sys_clk + 1'b1;
+		sclk4_reg <= (cnt3_sys_clk==9)? !sclk4_reg : sclk4_reg; end //sclk4_reg 2.5MHz
+end
+
+//en_rising
+always @(posedge sclk_reg) begin
+	en_delay <= en;
+	en_rising <= en & !en_delay;
+end
+
+//state changing
+always @(posedge sclk4_reg) begin
+	if(reset==1'b0) begin
+		case(state) 
+			idle: begin
+				if(en_rising==1'b1 & sclk_reg==1'b0 & sclk2_reg==1'b0) begin
+					state <= (read_write_flag==1'b0)? write : read; //write or read
+					datain_reg <= (read_write_flag==1'b0)? data_inout : 'b0; end //clock in datainout to datain_reg when changing to mode "write"
+				else begin
+					state <= state; end
+			end
+			///////////////////////////////
+			write: begin
+				if(cnt_bit==8) begin
+					if(en==1'b1) begin 
+						if(sclk_reg==1'b0 & sclk2_reg==1'b0) begin
+							if(read_write_flag==1'b0) state <= write;
+							if(read_write_flag==1'b1) begin //delay 1 sclk_reg cycle
+								if(state_delay==1'b0) state_delay <= 1'b1;
+								else if(state_delay==1'b1) begin
+									state_delay <= 1'b0;
+									state <= read; end
+							end
+						end
+					end
+					else if(en==1'b0) begin
+						state <= idle;  end
+				end
+			end
+			//////////////////////////////
+			read: begin
+				if(cnt_bit==8) begin
+					if(en==1'b1) begin
+						if(sclk_reg==1'b0 & sclk2_reg==1'b1) begin
+							state <= (read_write_flag==1'b0)? write : read; end
+						else state <= state;
+					end else if(en==1'b0) begin
+						state <= idle; end
+				end
+			end
+			//////////////////////////////
+			default: begin 
+				state <= state;
+	//			byte_ack_reg <= 1'b0;
+			end
+		endcase
+	end
+	else if(reset==1'b1) begin
+		state <= idle;
+	end
+end
+
+//cnt_bit
+always @(posedge sclk4_reg) begin
+	if(state==write) begin
+		if(proceed_initiate==1'b1) begin
+			if(sclk_reg==1'b0 & sclk2_reg==1'b0) begin
+				if(cnt_bit!=8) cnt_bit <= cnt_bit + 1'b1; 
+				else if(cnt_bit==8) begin
+					if(read_write_flag==1'b1) begin
+						if(state_delay==1'b1) cnt_bit <= 0;
+						else if(state_delay==1'b0) cnt_bit <= cnt_bit; 
+					end
+					else cnt_bit <= 0;
+				end
+			end
+		end
+	end
+	else if(state==read) begin
+		if(sclk_reg==1'b0 & sclk2_reg==1'b0) begin
+			cnt_bit <= (cnt_bit==8)? 0 : cnt_bit + 1'b1;
+		end
+	end
+	else cnt_bit <= 0;
+end
+
+//sdata 	sdata_reg 	dataout_reg
+always @(posedge sclk4_reg) begin
+	if(reset==1'b1) begin
+		proceed_initiate <= 1'b0; end
+	else if(reset==1'b0) begin
+		if(proceed_initiate==1'b0) begin //start bit
+			if(state==write) begin
+				if(sclk_reg==1'b0 & sclk2_reg==1'b1) begin
+					sdata_reg <= 1'b1; end
+				else if(sclk_reg==1'b1 & sclk2_reg==1'b1) begin
+					sdata_reg <= 1'b0; 
+					proceed_initiate <= 1'b1; end
+			end
+		end 
+		else if(proceed_initiate==1'b1) begin
+			case(cnt_bit)
+				0: begin //bit<0>
+					byte_ack_reg <= 1'b0;
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) begin //if "write"
+						sdata_reg <= datain_reg[7]; 
+						sdata_in_out_flag <= 1'b0; end //sdata output
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) begin //if "read"
+						dataout_reg[7] <= sdata; end
+					if(state==read & sclk_reg==1'b0 & sclk2_reg==1'b1) begin
+						sdata_in_out_flag <= 1'b1; end //sdata_input
+				end
+				//////////////////////////
+				1: begin
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_reg <= datain_reg[6]; 
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) dataout_reg[6] <= sdata; 
+				end
+				//////////////////////////
+				2:begin
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_reg <= datain_reg[5]; 
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) dataout_reg[5] <= sdata; 
+				end
+				/////////////////////////
+				3:begin
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_reg <= datain_reg[4]; 
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) dataout_reg[4] <= sdata; 
+				end
+				////////////////////////
+				4:begin
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_reg <= datain_reg[3]; 
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) dataout_reg[3] <= sdata; 
+				end
+				////////////////////////
+				5:begin
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_reg <= datain_reg[2]; 
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) dataout_reg[2] <= sdata; 
+				end
+				////////////////////////
+				6:begin
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_reg <= datain_reg[1]; 
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) dataout_reg[1] <= sdata; 
+				end
+				/////////////////////////
+				7: begin //bit<7>
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_reg <= datain_reg[0]; 
+					if(state==read & sclk_reg==1'b1 & sclk2_reg==1'b0) dataout_reg[0] <= sdata; 
+				end
+				//acknolege bit//////////
+				8: begin
+					if(state==write & sclk_reg==1'b0 & sclk2_reg==1'b0) sdata_in_out_flag <= 1'b1; //recieve acknowledge bit
+					if(state==read & sclk_reg==1'b0 & sclk2_reg==1'b1) begin //send acknowledge bit
+						sdata_reg <= 1'b0;
+						sdata_in_out_flag <= 1'b0; end
+					byte_ack_reg <= 1'b1;
+				end
+				/////////////////////////
+			endcase
+		end
+	end
+end
+
+//wires:		sclk		sdata    byte_ack		data_inout
+assign  byte_ack = byte_ack_reg;
+assign  sclk = (state==idle)? 1'b1 : sclk_reg;
+assign  sdata = (sdata_in_out_flag==1'b0)? sdata_reg : 'bz;
+assign  data_inout = (sdata_in_out_flag==1'b0)? 'bz : dataout_reg;
+
+endmodule
